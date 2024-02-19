@@ -1,0 +1,292 @@
+
+class ScreenshotService : Service() {
+
+    // Member variables
+    private var mgr: MediaProjectionManager? = null
+    private var wmgr: WindowManager? = null
+    private var mediaProjection: MediaProjection? = null
+    private var it: ImageTransmogrifier? = null
+    private var vdisplay: VirtualDisplay? = null
+    private val handlerThread = HandlerThread(javaClass.simpleName,
+            Process.THREAD_PRIORITY_BACKGROUND)
+    private var handler: Handler? = null
+    private var screenshotPermission: Intent? = null
+    private var isCaptureInProgress = false
+    private var resultCode = 0
+    private var isVirtualDisplayActive = false
+    private var resultData: Intent? = null
+    private var wasStarted = false
+
+    // Lifecycle methods
+    @RequiresApi(Build.VERSION_CODES.Q)
+    override fun onCreate() {
+        super.onCreate()
+        logMessage(tag, "Screenshot service onCreate")
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    override fun onStartCommand(intent: Intent, flags: Int, startId: Int): Int {
+        logMessage(tag, "onStartCommand intent = $intent")
+        // Handle different actions based on the intent received
+        when {
+            intent.action == null -> {
+                //this is the resulting intent from my activity that requests screen recording permission
+                logMessage(tag, "onStartCommand intent.getAction() == null")
+                resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 1337)
+                resultData = intent.getParcelableExtra(EXTRA_RESULT_INTENT)
+            }
+            ACTION_START_FOREGROUND == intent.action -> {
+                //also called from my activity that requests screen recording permission, after obtaining permission, to start the notification and foreground service b4 returning the result data and intent on android 14
+                logMessage(tag, "onStartCommand ACTION_START_FOREGROUND")
+                doIfAndroid14Plus(true) { foregroundify() }
+            }
+            INITIALYZE == intent.action -> {
+            //initialyze
+                logMessage(tag, "onStartCommand INITIALYZE")
+                initialize()
+            }
+            ACTION_RECORD == intent.action -> {
+                //called whenever I need a screenshot
+                logMessage(tag, "onStartCommand ACTION_RECORD")
+                if (mediaProjection == null) {
+                    mediaProjection = mgr!!.getMediaProjection(resultCode, resultData?.clone() as Intent)
+                }
+                startCapture()
+            }
+            ACTION_SHUTDOWN == intent.action -> {
+            //stop the service completely
+                shutdown()
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        logMessage(tag, "onDestroy")
+        shutdown()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent): IBinder? {
+        logMessage(tag, "onBind")
+        throw IllegalStateException("Binding not supported. Go away.")
+    }
+
+    // Helper methods
+    val windowManager: WindowManager?
+        get() = wmgr
+
+    fun getScreenshotServiceHandler(): Handler? {
+        return handler
+    }
+
+    fun shutdown() {
+        val it = ImageTransmogrifier(this)
+        it.close()
+        stopCapture()
+        Handler(Looper.getMainLooper()).postDelayed({
+            val sharedData = nonSharedData.getInstance()
+            sharedData.wasScreenshotPermissionGranted = ""
+            releaseMediaProjection()
+            releaseVirtualDisplay()
+            stopForeground(true)
+            stopSelf()
+        }, 100)
+    }
+
+    private fun releaseMediaProjection() {
+        // Check for null before releasing
+        mediaProjection?.stop()
+        mediaProjection = null
+        mgr = null
+    }
+
+    fun releaseVirtualDisplay() {
+        // Check for null before releasing
+        vdisplay?.release()
+        vdisplay = null
+        isVirtualDisplayActive = false // Reset the flag
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    fun initialize() {
+        logMessage(tag, "initialize")
+        wasStarted = true
+        mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        wmgr = getSystemService(WINDOW_SERVICE) as WindowManager
+        handlerThread.start()
+        handler = Handler(handlerThread.looper)
+        doIfAndroid14Plus(false) { foregroundify() }
+        doIfAndroid14Plus(true) { foregroundifyInitial() }
+        requestScreenCapturePermission()
+    }
+
+    fun stopCapture() {
+        isCaptureInProgress = false
+        val data = nonSharedData.getInstance()
+        if (data.releaseMediaProjectionAfterScreenShot && Build.VERSION.SDK_INT <= Build.VERSION_CODES.TIRAMISU) {
+            // Release the MediaProjection object
+            // Stop the VirtualDisplay
+            if (vdisplay != null) {
+                vdisplay!!.release()
+                vdisplay = null
+                isVirtualDisplayActive = false
+            }
+
+            if (mediaProjection != null) {
+                mediaProjection!!.stop()
+                mediaProjection = null
+            }
+        }
+    }
+
+    private fun startCapture() {
+        logMessage(tag, "startCapture")
+        try {
+            // Check if capture is already in progress
+            if (isCaptureInProgress) {
+                nonSharedData.getInstance().takeScreenshot = true
+                logMessage(message = "Capture in progress")
+                return
+            }
+
+            // Check if resultData is null
+            if (resultData == null && Build.VERSION.SDK_INT <= Build.VERSION_CODES.TIRAMISU) {
+                logMessage(tag, "startCapture resultData is null. Requesting permission...")
+                requestScreenCapturePermission()
+                return
+            }
+
+            // Check if MediaProjectionManager is null
+            if (mgr == null) {
+                logMessage(tag, "MediaProjectionManager (mgr) is null.")
+                return
+            }
+
+            // Check if mediaProjection is null
+            if (mediaProjection == null) {
+                logMessage(tag, "Failed to get MediaProjection. Permission might not be granted.")
+                // Reset the capture-related flags and values
+                isCaptureInProgress = false
+                screenshotPermission = null
+                // Toast but make sure it's on the main thread
+                Handler(Looper.getMainLooper()).post {
+                    Tools.toast(this, "Can't get MediaProjection. Screen recording permission might not be granted.")
+                }
+                return
+            }
+            isCaptureInProgress = true
+
+            if (isVirtualDisplayActive) {
+                //on android 14 or if the virtual display wasn't shut down, just wait for the next frame from onImageAvailable,
+                logMessage(tag, "Virtual display already active.")
+                return
+            }
+
+            it = ImageTransmogrifier(this)
+            logMessage(tag, "$resultCode $resultData")
+
+            // Register callback to handle onStop event
+            val cb: MediaProjection.Callback = object : MediaProjection.Callback() {
+                override fun onStop() {
+                    // Ensure that the capture-related flags and values are reset
+                    isCaptureInProgress = false
+                    stopCapture()
+                }
+            }
+            mediaProjection!!.registerCallback(cb, handler)
+
+            // Check if virtual display is not active
+            if (!isVirtualDisplayActive) {
+                // Create a new virtual display
+                vdisplay = mediaProjection!!.createVirtualDisplay(
+                    "Android Automations",
+                    it?.getWidth() ?: 0, it?.getHeight() ?: 0,
+                    resources.displayMetrics.densityDpi,
+                    VIRT_DISPLAY_FLAGS,
+                    it?.surface,
+                    null,
+                    handler
+                )
+                isVirtualDisplayActive = true // Set the flag to indicate that a virtual display is active
+            }
+
+        } catch (e: Exception) {
+            logMessage(tag, "Exception: ${e.message}")
+            // Reset the capture-related flags and values
+            isCaptureInProgress = false
+        }
+    }
+
+    private fun requestScreenCapturePermission() {
+        logMessage(tag, "Requesting screen capture permission...")
+        val permissionIntent = Intent(this, ScreenshotActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(permissionIntent)
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    fun foregroundifyInitial() {
+        val mgr = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        if (mgr.getNotificationChannel(CHANNEL_WHATEVER) == null) {
+            mgr.createNotificationChannel(NotificationChannel(CHANNEL_WHATEVER,
+                    "Foreground", NotificationManager.IMPORTANCE_DEFAULT))
+        }
+        val b = NotificationCompat.Builder(this, CHANNEL_WHATEVER)
+        b.setAutoCancel(true)
+                .setDefaults(Notification.DEFAULT_ALL)
+        b.setContentTitle(getString(R.string.app_name))
+                .setSmallIcon(R.drawable.codeconseven)
+                .setTicker(getString(R.string.app_name))
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIFY_ID, b.build(), FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    fun foregroundify() {
+        val mgr = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        if (mgr.getNotificationChannel(CHANNEL_WHATEVER) == null) {
+            mgr.createNotificationChannel(NotificationChannel(CHANNEL_WHATEVER,
+                    "Foreground", NotificationManager.IMPORTANCE_DEFAULT))
+        }
+        val b = NotificationCompat.Builder(this, CHANNEL_WHATEVER)
+        b.setAutoCancel(true)
+                .setDefaults(Notification.DEFAULT_ALL)
+        b.setContentTitle(getString(R.string.app_name))
+                .setSmallIcon(R.drawable.codeconseven)
+                .setTicker(getString(R.string.app_name))
+        when (Build.VERSION.SDK_INT >= 29) {
+            true -> {
+                startForeground(NOTIFY_ID, b.build(), FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            }
+            false -> {
+                startForeground(NOTIFY_ID, b.build())
+            }
+        }
+    }
+
+    fun doIfAndroid14Plus(shouldExecute: Boolean, action: () -> Unit) {
+        if (shouldExecute && Build.VERSION.SDK_INT >= 14) {
+            action.invoke()
+        } else if (!shouldExecute && Build.VERSION.SDK_INT < 14) {
+            action.invoke()
+        }
+    }
+
+    companion object {
+        private const val tag = "ScreenshotService"
+        const val CHANNEL_WHATEVER = "General"
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val ACTION_RECORD = "record_action"
+        const val ACTION_SHUTDOWN = "shutdown_action"
+        const val ACTION_START_FOREGROUND = "start_foreground_action"
+        const val NOTIFY_ID = 1
+        const val INITIALYZE = "initialize"
+        const val EXTRA_RESULT_INTENT = "resultIntent"
+        const val VIRT_DISPLAY_FLAGS = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
+    }
+
+
+}

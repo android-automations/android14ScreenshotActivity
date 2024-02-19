@@ -1,0 +1,101 @@
+class ImageTransmogrifier(private val svc: ScreenshotService) : ImageReader.OnImageAvailableListener {
+    private val width: Int
+    private val height: Int
+    private val imageReader: ImageReader
+    private var latestBitmap: Bitmap? = null
+    private var isImageReaderClosed = false
+    private var data = nonSharedData.getInstance() //data class for simple albeit cumbersome data handling and handing over the screenshot.
+
+    init {
+        logMessage(TAG, "ImageTransmogrifier started")
+
+        // Get display size
+        val displaySize = DisplayUtils.getDeviceScreenSize(svc.applicationContext)
+        width = displaySize[0]
+        height = displaySize[1]
+
+        // Initialize ImageReader
+        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 1)
+        imageReader.setOnImageAvailableListener(this, svc.getScreenshotServiceHandler())
+    }
+
+    override fun onImageAvailable(reader: ImageReader) {
+        data = nonSharedData.getInstance()
+
+        try {
+            logMessage(TAG, "IT onImageAvailable started")
+
+            // Acquire the image from ImageReader
+            val image = reader.acquireNextImage()
+            if (image != null) {
+                // Check if taking screenshots is enabled
+                if (!data.takeScreenshot) {
+                    image.close()
+                    close()
+                    return
+                }
+
+                // Process the image
+                val planes = image.planes
+                val buffer = planes[0].buffer
+                val pixelStride = planes[0].pixelStride
+                val rowStride = planes[0].rowStride
+                val rowPadding = rowStride - pixelStride * width
+                val bitmapWidth = width + rowPadding / pixelStride
+                if (latestBitmap == null || latestBitmap!!.width != bitmapWidth || latestBitmap!!.height != height) {
+                    latestBitmap?.recycle()
+                    latestBitmap = Bitmap.createBitmap(bitmapWidth, height, Bitmap.Config.ARGB_8888)
+                }
+                latestBitmap?.copyPixelsFromBuffer(buffer)
+                image.close()
+
+                // Copy bitmap and update data
+                val bit = latestBitmap as Bitmap
+                val bitt: Bitmap = bit.copy(bit.config, true)
+                data.latestBitmap = bitt
+                data.screenshotFinished = true
+                data.takeScreenshot = false
+                data.waitngForScreenshot = false
+
+                close()
+            }
+        } catch (e: Exception) {
+            logMessage(TAG, "Error in onImageAvailable")
+        }
+    }
+
+    // Getters for width and height
+    fun getWidth(): Int {
+        return width
+    }
+
+    fun getHeight(): Int {
+        return height
+    }
+
+    // Get surface from ImageReader
+    val surface: Surface
+        get() = imageReader.surface
+
+    // Close resources
+    fun close() {
+        val data = nonSharedData.getInstance()
+        svc.stopCapture()
+        if (data.releaseMediaProjectionAfterScreenShot && Build.VERSION.SDK_INT <= Build.VERSION_CODES.TIRAMISU) {
+            if (!isImageReaderClosed) {
+                imageReader.close()
+                isImageReaderClosed = true
+            }
+        }
+    }
+
+    // Utility class for getting device screen size
+    object DisplayUtils {
+    //   .....  get the device screen size
+    }
+
+
+    companion object {
+        const val TAG = "ImageTransmogrifier"
+    }
+}
